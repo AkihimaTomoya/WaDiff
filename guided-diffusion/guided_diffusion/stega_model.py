@@ -1,3 +1,4 @@
+# Add function for fp16
 import math
 import torch
 from torch import nn
@@ -80,7 +81,7 @@ class StegaStampDecoder(nn.Module):
         super(StegaStampDecoder, self).__init__()
         self.resolution = resolution
         self.IMAGE_CHANNELS = IMAGE_CHANNELS
-        self.fingerprint_size=fingerprint_size
+        self.fingerprint_size = fingerprint_size
         self.decoder = nn.Sequential(
             nn.Conv2d(IMAGE_CHANNELS, 32, (3, 3), 2, 1),  # 16
             nn.ReLU(),
@@ -104,6 +105,20 @@ class StegaStampDecoder(nn.Module):
         )
 
     def forward(self, image):
+        # Ensure input and model parameters have consistent dtype
+        # This handles mixed precision training issues
+        target_dtype = next(self.decoder.parameters()).dtype
+        if image.dtype != target_dtype:
+            image = image.to(dtype=target_dtype)
+        
         x = self.decoder(image)
         x = x.view(-1, self.resolution * self.resolution * 128 // 32 // 32)
         return self.dense(x)
+
+    def convert_to_fp16(self):
+        """Convert model to fp16 while ensuring consistency"""
+        return self.half()
+    
+    def convert_to_fp32(self):
+        """Convert model back to fp32"""
+        return self.float()
