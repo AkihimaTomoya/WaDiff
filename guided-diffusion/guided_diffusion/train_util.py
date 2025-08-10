@@ -1,10 +1,107 @@
-#Change for kaggle training
+#Change for kaggle training - Optimized checkpoint management
 import copy
 import functools
 import os
 import gc
+import re
+from pathlib import Path
+import shutil
 
-import blobfile as bf
+class FileHandler:
+    """Replacement for blobfile using standard Python libraries"""
+    
+    @staticmethod
+    def ls(path):
+        """List files in directory"""
+        try:
+            if os.path.isdir(path):
+                return os.listdir(path)
+            else:
+                return []
+        except (OSError, FileNotFoundError):
+            return []
+
+    @staticmethod
+    def rm(path):
+        """Remove file or directory"""
+        try:
+            if os.path.isdir(path):
+                shutil.rmtree(path)
+            elif os.path.exists(path):
+                os.remove(path)
+        except (OSError, FileNotFoundError, PermissionError) as e:
+            print(f"Warning: Could not remove {path}: {e}")
+
+    @staticmethod
+    def stat(path):
+        """Get file statistics"""
+        class StatResult:
+            def __init__(self, size):
+                self.size = size
+        
+        try:
+            return StatResult(os.path.getsize(path))
+        except (OSError, FileNotFoundError):
+            return StatResult(0)
+
+    @staticmethod
+    def exists(path):
+        """Check if path exists"""
+        return os.path.exists(path)
+
+    @staticmethod
+    def join(*args):
+        """Join path components"""
+        return os.path.join(*args)
+
+    @staticmethod
+    def dirname(path):
+        """Get directory name"""
+        return os.path.dirname(path)
+
+    @staticmethod
+    def copy(src, dst):
+        """Copy file from src to dst"""
+        try:
+            # Ensure destination directory exists
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            shutil.copy2(src, dst)
+        except (OSError, FileNotFoundError, PermissionError) as e:
+            print(f"Warning: Could not copy {src} to {dst}: {e}")
+            raise
+
+    @staticmethod
+    def move(src, dst):
+        """Move file from src to dst"""
+        try:
+            # Ensure destination directory exists
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            shutil.move(src, dst)
+        except (OSError, FileNotFoundError, PermissionError) as e:
+            print(f"Warning: Could not move {src} to {dst}: {e}")
+            raise
+
+    class BlobFile:
+        """File context manager replacement"""
+        def __init__(self, path, mode='rb'):
+            self.path = path
+            self.mode = mode
+            self.file = None
+            
+        def __enter__(self):
+            # Ensure directory exists when writing
+            if 'w' in self.mode or 'a' in self.mode:
+                os.makedirs(os.path.dirname(self.path), exist_ok=True)
+            self.file = open(self.path, self.mode)
+            return self.file
+            
+        def __exit__(self, exc_type, exc_val, exc_tb):
+            if self.file:
+                self.file.close()
+
+# Create global instance
+bf = FileHandler()
+
 import torch as th
 import torch.distributed as dist
 from torch.nn.parallel.distributed import DistributedDataParallel as DDP
@@ -278,6 +375,10 @@ class TrainLoop:
             self._update_ema()
         self._anneal_lr()
         self.log_step()
+        
+        # Kiểm tra disk space mỗi nửa save_interval
+        if self.step > 0 and self.step % (self.save_interval // 2) == 0:
+            check_disk_space(get_blob_logdir(), min_free_gb=2.0)
 
     def forward_backward(self, batch, cond):
         self.mp_trainer.zero_grad()
@@ -344,36 +445,119 @@ class TrainLoop:
         logger.logkv("samples", (self.step + self.resume_step + 1) * self.global_batch)
 
     def save(self):
-        # Trước khi lưu checkpoint, prune cũ
+        """
+        Improved save method with better checkpoint management and error handling.
+        """
         logdir = get_blob_logdir()
-        prune_old_checkpoints(logdir, keep=2)
-
-        def save_checkpoint(rate, params):
+        
+        # Kiểm tra disk space trước khi save
+        check_disk_space(logdir, min_free_gb=2.6)
+        
+        # Cleanup checkpoint cũ TRƯỚC khi lưu checkpoint mới
+        prune_old_checkpoints(logdir, keep=2)  # Giữ 2 checkpoint mới nhất
+        
+        def save_checkpoint_safely(rate, params):
+            """Save checkpoint với error handling và atomic operations."""
             state_dict = self.mp_trainer.master_params_to_state_dict(params)
+            
             if dist_util.get_rank() == 0:
-                logger.log(f"saving model {rate}...")
                 filename = (
                     f"model{self.step + self.resume_step:06d}.pt"
                     if not rate
                     else f"ema_{rate}_{self.step + self.resume_step:06d}.pt"
                 )
-                path = bf.join(logdir, filename)
-                with bf.BlobFile(path, 'wb') as f:
-                    th.save(state_dict, f)
+                
+                logger.log(f"💾 Saving {filename}...")
+                
+                final_path = bf.join(logdir, filename)
+                temp_path = final_path + ".tmp"
+                
+                try:
+                    # Ghi vào file tạm thời
+                    with bf.BlobFile(temp_path, 'wb') as f:
+                        th.save(state_dict, f)
+                    
+                    # Kiểm tra file tạm có được ghi đầy đủ không
+                    if bf.exists(temp_path):
+                        temp_size = bf.stat(temp_path).size
+                        if temp_size > 0:
+                            # Xóa file cũ nếu tồn tại
+                            if bf.exists(final_path):
+                                bf.rm(final_path)
+                            
+                            # Rename atomic - use move instead of copy+delete
+                            bf.move(temp_path, final_path)
+                            
+                            # Verify file sau khi lưu
+                            final_size = bf.stat(final_path).size
+                            logger.log(f"✅ Successfully saved {filename} ({final_size / (1024*1024):.1f} MB)")
+                        else:
+                            raise ValueError(f"Temporary file {temp_path} is empty")
+                    else:
+                        raise ValueError(f"Temporary file {temp_path} was not created")
+                        
+                except Exception as e:
+                    logger.log(f"❌ Failed to save {filename}: {e}")
+                    
+                    # Cleanup temp file nếu có
+                    if bf.exists(temp_path):
+                        try:
+                            bf.rm(temp_path)
+                        except:
+                            pass
+                    
+                    raise e  # Re-raise để caller biết có lỗi
 
-        # Lưu model và EMA
-        save_checkpoint(0, self.mp_trainer.master_params)
-        for rate, params in zip(self.ema_rate, self.ema_params):
-            save_checkpoint(rate, params)
+        # Lưu model và EMA checkpoints
+        try:
+            save_checkpoint_safely(0, self.mp_trainer.master_params)
+            
+            for rate, params in zip(self.ema_rate, self.ema_params):
+                save_checkpoint_safely(rate, params)
+                
+        except Exception as e:
+            logger.log(f"Error saving model checkpoints: {e}")
+            # Có thể continue để ít nhất lưu được optimizer state
 
         # Lưu optimizer state
         if dist_util.get_rank() == 0:
-            opt_path = bf.join(logdir, f"opt{self.step + self.resume_step:06d}.pt")
-            with bf.BlobFile(opt_path, 'wb') as f:
-                th.save(self.opt.state_dict(), f)
+            opt_filename = f"opt{self.step + self.resume_step:06d}.pt"
+            opt_final_path = bf.join(logdir, opt_filename)
+            opt_temp_path = opt_final_path + ".tmp"
+            
+            logger.log(f"💾 Saving {opt_filename}...")
+            
+            try:
+                with bf.BlobFile(opt_temp_path, 'wb') as f:
+                    th.save(self.opt.state_dict(), f)
+                
+                if bf.exists(opt_temp_path) and bf.stat(opt_temp_path).size > 0:
+                    if bf.exists(opt_final_path):
+                        bf.rm(opt_final_path)
+                    bf.move(opt_temp_path, opt_final_path)
+                    
+                    opt_size = bf.stat(opt_final_path).size
+                    logger.log(f"✅ Successfully saved {opt_filename} ({opt_size / (1024*1024):.1f} MB)")
+                else:
+                    raise ValueError("Optimizer temp file is empty or not created")
+                    
+            except Exception as e:
+                logger.log(f"❌ Failed to save optimizer state: {e}")
+                if bf.exists(opt_temp_path):
+                    try:
+                        bf.rm(opt_temp_path)
+                    except:
+                        pass
 
+        # Sync tất cả processes
         if dist.is_initialized():
             dist.barrier()
+        
+        # Memory cleanup sau khi save
+        if th.cuda.is_available():
+            th.cuda.empty_cache()
+        
+        logger.log(f"📁 Checkpoint save completed at step {self.step + self.resume_step}")
 
 
 def parse_resume_step_from_filename(filename):
@@ -416,15 +600,202 @@ def log_loss_dict(diffusion, ts, losses):
             quartile = int(4 * sub_t / diffusion.num_timesteps)
             logger.logkv_mean(f"{key}_q{quartile}", sub_loss)
 
-def prune_old_checkpoints(logdir: str, keep: int = 2):
+
+def prune_old_checkpoints(logdir: str, keep: int = 3):
+    """
+    Giữ lại tối đa `keep` checkpoint mới nhất cho mỗi loại file, xóa các file cũ hơn.
+    Phân loại chính xác: model, EMA (theo rate), optimizer
+    """
+    if dist_util.get_rank() != 0:
+        return  # Chỉ rank 0 thực hiện cleanup
+    
     try:
-        files = bf.ls(logdir)
-    except Exception:
+        # Kiểm tra thư mục có tồn tại không
+        if not bf.exists(logdir):
+            logger.log(f"Warning: Logdir {logdir} does not exist")
+            return
+            
+        # Lấy danh sách file
+        try:
+            files = bf.ls(logdir)
+        except Exception as e:
+            logger.log(f"Warning: Could not list files in {logdir}: {e}")
+            return
+            
+        # Phân loại các file checkpoint theo loại
+        model_checkpoints = []      # [(step, filename)]
+        ema_checkpoints = {}        # {rate: [(step, filename)]}
+        optimizer_checkpoints = []  # [(step, filename)]
+        other_files = []           # Các file khác
+        
+        logger.log(f"Found {len(files)} files in {logdir}")
+        
+        for filename in files:
+            if not filename.endswith('.pt'):
+                continue
+                
+            # Model checkpoints: modelXXXXXX.pt
+            model_match = re.match(r'^model(\d{6})\.pt$', filename)
+            if model_match:
+                step = int(model_match.group(1))
+                model_checkpoints.append((step, filename))
+                continue
+            
+            # EMA checkpoints: ema_RATE_XXXXXX.pt
+            ema_match = re.match(r'^ema_([0-9.]+)_(\d{6})\.pt$', filename)
+            if ema_match:
+                rate = ema_match.group(1)
+                step = int(ema_match.group(2))
+                if rate not in ema_checkpoints:
+                    ema_checkpoints[rate] = []
+                ema_checkpoints[rate].append((step, filename))
+                continue
+            
+            # Optimizer checkpoints: optXXXXXX.pt
+            opt_match = re.match(r'^opt(\d{6})\.pt$', filename)
+            if opt_match:
+                step = int(opt_match.group(1))
+                optimizer_checkpoints.append((step, filename))
+                continue
+            
+            # Các file .pt khác
+            other_files.append(filename)
+        
+        # Thống kê trước khi cleanup
+        logger.log(f"Before cleanup:")
+        logger.log(f"  Model checkpoints: {len(model_checkpoints)}")
+        logger.log(f"  EMA checkpoints: {sum(len(v) for v in ema_checkpoints.values())}")
+        logger.log(f"  Optimizer checkpoints: {len(optimizer_checkpoints)}")
+        logger.log(f"  Other .pt files: {len(other_files)}")
+        
+        total_deleted = 0
+        deleted_size_mb = 0
+        
+        # Xóa model checkpoints cũ
+        if len(model_checkpoints) > keep:
+            model_checkpoints.sort(key=lambda x: x[0])  # Sort by step
+            files_to_delete = model_checkpoints[:-keep]
+            
+            for step, filename in files_to_delete:
+                try:
+                    file_path = bf.join(logdir, filename)
+                    
+                    # Tính size file trước khi xóa
+                    try:
+                        file_size = bf.stat(file_path).size
+                        deleted_size_mb += file_size / (1024 * 1024)
+                    except:
+                        pass
+                    
+                    bf.rm(file_path)
+                    logger.log(f"✓ Deleted old model checkpoint: {filename} (step {step})")
+                    total_deleted += 1
+                except Exception as e:
+                    logger.log(f"✗ Failed to delete {filename}: {e}")
+        
+        # Xóa EMA checkpoints cũ cho mỗi rate
+        for rate, checkpoints in ema_checkpoints.items():
+            if len(checkpoints) > keep:
+                checkpoints.sort(key=lambda x: x[0])  # Sort by step
+                files_to_delete = checkpoints[:-keep]
+                
+                for step, filename in files_to_delete:
+                    try:
+                        file_path = bf.join(logdir, filename)
+                        
+                        # Tính size file trước khi xóa
+                        try:
+                            file_size = bf.stat(file_path).size
+                            deleted_size_mb += file_size / (1024 * 1024)
+                        except:
+                            pass
+                        
+                        bf.rm(file_path)
+                        logger.log(f"✓ Deleted old EMA checkpoint: {filename} (rate {rate}, step {step})")
+                        total_deleted += 1
+                    except Exception as e:
+                        logger.log(f"✗ Failed to delete {filename}: {e}")
+        
+        # Xóa optimizer checkpoints cũ
+        if len(optimizer_checkpoints) > keep:
+            optimizer_checkpoints.sort(key=lambda x: x[0])  # Sort by step
+            files_to_delete = optimizer_checkpoints[:-keep]
+            
+            for step, filename in files_to_delete:
+                try:
+                    file_path = bf.join(logdir, filename)
+                    
+                    # Tính size file trước khi xóa
+                    try:
+                        file_size = bf.stat(file_path).size
+                        deleted_size_mb += file_size / (1024 * 1024)
+                    except:
+                        pass
+                    
+                    bf.rm(file_path)
+                    logger.log(f"✓ Deleted old optimizer checkpoint: {filename} (step {step})")
+                    total_deleted += 1
+                except Exception as e:
+                    logger.log(f"✗ Failed to delete {filename}: {e}")
+        
+        # Thống kê sau cleanup
+        remaining_model = max(0, len(model_checkpoints) - max(0, len(model_checkpoints) - keep))
+        remaining_ema = sum(max(0, len(v) - max(0, len(v) - keep)) for v in ema_checkpoints.values())
+        remaining_opt = max(0, len(optimizer_checkpoints) - max(0, len(optimizer_checkpoints) - keep))
+        
+        logger.log(f"After cleanup:")
+        logger.log(f"  Remaining model checkpoints: {remaining_model}")
+        logger.log(f"  Remaining EMA checkpoints: {remaining_ema}")
+        logger.log(f"  Remaining optimizer checkpoints: {remaining_opt}")
+        logger.log(f"  Total files deleted: {total_deleted}")
+        logger.log(f"  Disk space freed: {deleted_size_mb:.1f} MB")
+        
+        if total_deleted > 0:
+            logger.log(f"🧹 Checkpoint cleanup completed successfully!")
+        else:
+            logger.log("ℹ️  No old checkpoints to clean up")
+            
+    except Exception as e:
+        logger.log(f"Error in prune_old_checkpoints: {e}")
+        import traceback
+        logger.log(f"Traceback: {traceback.format_exc()}")
+
+
+def check_disk_space(logdir: str, min_free_gb: float = 2.0):
+    """
+    Kiểm tra dung lượng disk còn trống và thực hiện cleanup tích cực nếu cần.
+    """
+    if dist_util.get_rank() != 0:
         return
-    ckpts = sorted([f for f in files if f.endswith('.pt')])
-    if len(ckpts) > keep:
-        for old in ckpts[:-keep]:
-            try:
-                bf.rm(bf.join(logdir, old))
-            except Exception:
-                pass
+        
+    try:
+        import shutil
+        total, used, free = shutil.disk_usage(logdir)
+        free_gb = free / (1024**3)
+        used_gb = used / (1024**3)
+        total_gb = total / (1024**3)
+        
+        logger.log(f"💾 Disk space - Free: {free_gb:.2f} GB / Total: {total_gb:.2f} GB ({free_gb/total_gb*100:.1f}% free)")
+        
+        if free_gb < min_free_gb:
+            logger.log(f"⚠️  WARNING: Low disk space! Free: {free_gb:.2f} GB < {min_free_gb:.2f} GB threshold")
+            logger.log("🧹 Performing aggressive cleanup - keeping only 1 most recent checkpoint of each type")
+            
+            # Cleanup tích cực - chỉ giữ 1 checkpoint gần nhất
+            prune_old_checkpoints(logdir, keep=1)
+            
+            # Kiểm tra lại sau cleanup
+            total, used, free = shutil.disk_usage(logdir)
+            free_gb_after = free / (1024**3)
+            freed_space = free_gb_after - free_gb
+            
+            if freed_space > 0:
+                logger.log(f"✅ Freed {freed_space:.2f} GB. New free space: {free_gb_after:.2f} GB")
+            
+            if free_gb_after < min_free_gb * 0.5:  # Nếu vẫn còn rất ít
+                logger.log(f"🚨 CRITICAL: Disk space still very low after cleanup!")
+        else:
+            logger.log("✅ Disk space is sufficient")
+            
+    except Exception as e:
+        logger.log(f"Could not check disk space: {e}")
