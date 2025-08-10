@@ -54,6 +54,33 @@ def main_worker(rank, world_size, args):
         dist_util.setup_dist()
         logger.configure(dir=args.output_dir)
 
+        def check_checkpoint_before_resume(checkpoint_path):
+            if checkpoint_path and os.path.exists(checkpoint_path):
+                print(f"📋 Checkpoint Analysis: {os.path.basename(checkpoint_path)}")
+                
+                try:
+                    state_dict = th.load(checkpoint_path, map_location='cpu')
+                    
+                    # Kiểm tra input layer shape
+                    if 'input_blocks.0.0.weight' in state_dict:
+                        input_shape = state_dict['input_blocks.0.0.weight'].shape
+                        print(f"   Input conv shape: {input_shape}")
+                        print(f"   Input channels: {input_shape[1]}")
+                        
+                    print(f"   Total parameters: {len(state_dict):,}")
+                    print(f"   File size: {os.path.getsize(checkpoint_path) / (1024*1024):.1f} MB")
+                    
+                    del state_dict
+                    print("   ✅ Checkpoint verified successfully")
+                    return True
+                    
+                except Exception as e:
+                    print(f"   ❌ Checkpoint verification failed: {e}")
+                    return False
+            return True
+        if rank == 0:
+            check_checkpoint_before_resume(args.resume_checkpoint)
+
         if rank == 0:
             logger.log("creating model and diffusion...")
         
